@@ -1,0 +1,9 @@
+# Copy to backend.tf and fill in the client-approved state storage.
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "rg-terraform-state"
+    storage_account_name = "stadhatfstate"
+    container_name       = "tfstate"
+    key                  = "n8n/dev.tfstate"
+  }
+}

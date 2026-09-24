@@ -1,0 +1,11 @@
+#,Source,Destination,Protocol,Port,Direction,Purpose,Duration,Notes
+1,ADHA VPN/User Network,Internal n8n ingress LB,TCP,443,Inbound,n8n UI/API/Webhooks,Permanent,Restrict source CIDRs
+2,AKS node/subnet,PostgreSQL private endpoint,TCP,5432,Outbound,n8n database,Permanent,Private DNS
+3,AKS node/subnet,Redis private endpoint,TCP,6380,Outbound,n8n queue,Permanent,TLS
+4,AKS node/subnet,Key Vault private endpoint,TCP,443,Outbound,Secrets CSI,Permanent,Private DNS
+5,AKS node/subnet,ACR private endpoint,TCP,443,Outbound,Container image pulls,Permanent,Private DNS
+6,AKS node/subnet,Blob private endpoint,TCP,443,Outbound,External binary/execution data,Permanent,Private DNS
+7,AKS node/subnet,Azure control plane endpoints,TCP,443,Outbound,Azure API/identity,Permanent,ADHA-approved Azure FQDNs
+8,AKS node/subnet,ADHA DNS,TCP/UDP,53,Outbound,DNS resolution,Permanent,Use approved DNS servers
+9,AKS workloads,Approved external APIs,TCP,443,Outbound,n8n integrations,Permanent,Use explicit FQDN/IP allow-list
+10,ADHA monitoring,AKS metrics/log endpoints,TCP,443,Outbound/Inbound,Observability,Per ADHA design,Use approved monitoring architecture

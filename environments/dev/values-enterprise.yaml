@@ -1,0 +1,857 @@
+# =============================================================================
+# N8N ENTERPRISE HELM VALUES - Azure AKS Production Deployment
+# =============================================================================
+# Chart: n8n-hosting/charts/n8n (tag v1.10.1) — installed from local path   [PROD]
+# Arch:  Multi-Main HA + Queue Mode + Webhook Processors + Task Runners
+# Infra: Azure AKS | Azure PostgreSQL | Azure Redis | Azure KeyVault | Azure Blob (or database mode)
+# =============================================================================
+#
+# THIS IS A TEMPLATE — placeholders like <N8N_DOMAIN> are filled at deploy time.
+#   1. Edit .env (single source of truth for all environment values)
+#   2. Run scripts/deploy.sh — it renders this file to
+#      values-enterprise-rendered.yaml (a copy) and deploys that.
+#   The original file keeps its <PLACEHOLDER> tokens; never hand-fill them here.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 0. CONTAINER IMAGES — derived at deploy time, never use :stable
+# -----------------------------------------------------------------------------
+# Image REPOSITORY is derived by deploy.sh from ACR_NAME in .env:
+#   ACR_NAME set   → <ACR_NAME>.azurecr.io/n8nio/n8n
+#   ACR_NAME empty → docker.io/n8nio/n8n (Docker Hub fallback)
+#
+# deploy.sh passes --set image.repository=... and --set image.tag=...
+# at Helm install time, which OVERRIDES the values below. The <N8N_IMAGE_TAG>
+# placeholder is rendered by deploy.sh from .env and serves as documentation.
+# -----------------------------------------------------------------------------
+image:
+  repository: "docker.io/n8nio/n8n"       # Overridden by deploy.sh --set (ACR or Docker Hub)
+  tag: "<N8N_IMAGE_TAG>"                  # from .env: 2.30.6 (NEVER use :stable in prod)
+  pullPolicy: IfNotPresent
+
+# -----------------------------------------------------------------------------
+# 1. MULTI-MAIN HIGH AVAILABILITY (Enterprise License Required)
+# -----------------------------------------------------------------------------
+multiMain:
+  enabled: true
+  replicas: 3                          # PROD: 3 main (DEV: 2 | UAT: 2)
+                                       # Must equal hpa.main.minReplicas (§9) or HPA scales back down.
+
+# -----------------------------------------------------------------------------
+# 2. QUEUE MODE - Workers + Redis-backed job queue
+# -----------------------------------------------------------------------------
+queueMode:
+  enabled: true
+  workerReplicaCount: 4                # PROD: 4 (HPA scales up). DEV: 2 | UAT: 3. Match hpa.worker.minReplicas.
+  workerConcurrency: 20                # Max concurrent executions per worker (same all envs)
+
+# -----------------------------------------------------------------------------
+# 3. WEBHOOK PROCESSOR - Dedicated pods for incoming webhooks
+# -----------------------------------------------------------------------------
+webhookProcessor:
+  enabled: true
+  replicaCount: 3                      # PROD: 3 (DEV: 1 | UAT: 2). Match hpa.webhookProcessor.minReplicas.
+  disableProductionWebhooksOnMainProcess: true   # Main pods do NOT handle webhooks
+
+# -----------------------------------------------------------------------------
+# 4. TASK RUNNERS - Isolated code execution (JS + Python) via sidecars
+# -----------------------------------------------------------------------------
+taskRunners:
+  enabled: true
+
+  # Runner image — repository derived by deploy.sh from ACR_NAME (same as main)
+  image:
+    repository: "docker.io/n8nio/runners"      # Overridden by deploy.sh --set (ACR or Docker Hub)
+    tag: "<RUNNERS_IMAGE_TAG>"                 # from .env: 2.30.6 (must match main)
+    # --- P4 Hardening (future): use distroless runner image ---
+    # tag: "<RUNNERS_IMAGE_TAG>-distroless"    # No shell, no apt — minimal attack surface
+    pullPolicy: IfNotPresent
+
+  authToken:
+    existingSecret: "n8n-runner-token"
+    existingSecretKey: "auth-token"
+
+  broker:
+    listenAddress: "0.0.0.0"
+    port: 5679
+
+  launcher:
+    logLevel: info
+    autoShutdownTimeout: 15
+
+  nativePythonRunner: true
+
+  # Custom launcher config — REQUIRED to actually enforce Code-node module rules.
+  # In EXTERNAL runner mode, NODE_FUNCTION_ALLOW_* (JS) and the Python allow/deny
+  # lists are read from this JSON's env-overrides, NOT from container env vars.
+  # deploy.sh creates the 'n8n-task-runners' ConfigMap from azure/n8n-task-runners.json;
+  # the chart mounts it at /etc/n8n-task-runners.json on every runner sidecar (main+worker).
+  customConfig:
+    enabled: true
+    configMapName: "n8n-task-runners"
+    configMapKey: "n8n-task-runners.json"
+
+  # Runtime env vars passed to every runner pod.
+  # N8N_BLOCK_RUNNER_ENV_ACCESS defaults to true, but making it explicit here
+  # for compliance audit trails.
+  extraEnv:
+    - name: N8N_BLOCK_RUNNER_ENV_ACCESS
+      value: "true"
+
+  # --- Runner hardening ---
+  # The chart ALREADY hardens the runner sidecar in its own template (hardcoded):
+  #   allowPrivilegeEscalation: false  +  capabilities.drop: [ALL]
+  # So "can't become admin" and "no system powers" are already enforced — the two
+  # most important locks. The chart does NOT expose a taskRunners.securityContext
+  # knob, so we can't add runAsNonRoot / readOnlyRootFilesystem / a fixed UID via
+  # values here — those (STRONGER tier) need the distroless runner image and a
+  # post-render/chart change, deferred to PROD prep:
+  #   - image tag "<RUNNERS_IMAGE_TAG>-distroless" (§4), imported to ACR
+  #   - readOnlyRootFilesystem: true + a /tmp emptyDir(memory)
+  #   - runAsUser/runAsGroup 65532
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# -----------------------------------------------------------------------------
+# 5. ENTERPRISE LICENSE
+# -----------------------------------------------------------------------------
+license:
+  enabled: true
+  # Option A: Direct activation key (from KeyVault via SecretProviderClass)
+  # activationKey: "<N8N_LICENSE_KEY>"
+  #
+  # Option B: Reference existing K8s secret (RECOMMENDED - populated by CSI driver)
+  existingSecret:
+    name: "n8n-license-secret"
+    key: "license-key"
+
+# -----------------------------------------------------------------------------
+# 6. DATABASE - Azure PostgreSQL (Private Endpoint)
+# -----------------------------------------------------------------------------
+database:
+  type: postgresdb
+  useExternal: true
+  host: "<AZURE_POSTGRES_HOST>"
+  port: 5432
+  database: "<POSTGRES_DB_NAME>"
+  schema: "public"
+  # NON-ROOT app user (security best practice — see scripts/db-bootstrap.sql)
+  # Mirrors the POSTGRES_NON_ROOT_USER pattern from official n8n manifests.
+  # The Postgres server admin is used ONLY to create this user (deploy.sh Phase 8).
+  user: "<POSTGRES_APP_USER>"
+  passwordSecret:
+    name: "n8n-db-secret"             # K8s secret (created by CSI driver or script)
+    key: "app-password"               # → mapped from KV secret n8n-db-app-password
+  ssl:
+    enabled: true                      # Azure PostgreSQL requires SSL
+    rejectUnauthorized: false          # Azure uses DigiCert CA — n8n Alpine image may lack it
+                                       # Safe behind private endpoint; tighten to true + CA cert later
+
+# -----------------------------------------------------------------------------
+# 7. REDIS - Azure Cache for Redis (Private Endpoint)
+# -----------------------------------------------------------------------------
+redis:
+  enabled: true
+  useExternal: true
+  host: "<AZURE_REDIS_HOST>"
+  port: <AZURE_REDIS_PORT>             # 10000 (Managed Redis) | 6380 (Cache for Redis) — set in .env
+  tls: true                            # Both Azure Redis services require TLS
+  passwordSecret:
+    name: "n8n-redis-secret"
+    key: "password"
+  database: 0
+  timeout: 10000
+  # Worker queue tuning (enterprise defaults)
+  worker:
+    timeout: 60                        # Worker shutdown timeout (seconds)
+    lockDuration: 60000                # Worker lease duration (ms)
+    lockRenewTime: 10000               # Lock renewal frequency (ms)
+    stalledInterval: 30000             # Stalled job check interval (ms)
+    maxStalledCount: 2                 # Max stalled job retries
+
+# -----------------------------------------------------------------------------
+# 8. EXTERNAL BINARY / EXECUTION STORAGE — Azure Blob via config.extraEnv (§22)
+# -----------------------------------------------------------------------------
+# Storage is driven entirely by config.extraEnv: N8N_DEFAULT_BINARY_DATA_MODE +
+# N8N_EXTERNAL_STORAGE_AZURE_* — auto-set by deploy.sh (Azure Blob if
+# AZURE_STORAGE_ACCOUNT is set, else "database"; managed identity, no keys).
+# The chart's own object-storage integration is left disabled.
+s3:
+  enabled: false
+
+# -----------------------------------------------------------------------------
+# 9. HORIZONTAL POD AUTOSCALER (HPA)
+# -----------------------------------------------------------------------------
+hpa:
+  main:
+    enabled: true
+    minReplicas: 3                     # PROD: 3 (matches multiMain.replicas §2) | DEV: 2 | UAT: 2
+    maxReplicas: 6                     # PROD: 6 | DEV: 3 | UAT: 4
+    targetCPUUtilizationPercentage: 70
+  worker:
+    enabled: true
+    minReplicas: 4                     # PROD: 4 (matches queueMode.workerReplicaCount §3) | DEV: 2 | UAT: 3
+    maxReplicas: 20                    # PROD: 20 | DEV: 4 | UAT: 8
+    targetCPUUtilizationPercentage: 75
+  webhookProcessor:
+    enabled: true
+    minReplicas: 3                     # PROD: 3 (matches webhookProcessor.replicaCount §4) | DEV: 1 | UAT: 2
+    maxReplicas: 10                    # PROD: 10 | DEV: 3 | UAT: 4
+    targetCPUUtilizationPercentage: 70
+
+# -----------------------------------------------------------------------------
+# 10. KEDA AUTOSCALING (Queue-length based - Optional, overrides worker HPA)
+# -----------------------------------------------------------------------------
+# Uncomment this section AND set hpa.worker.enabled=false to use KEDA instead
+# Prerequisites: KEDA must be installed in the cluster
+#
+# keda:
+#   enabled: true
+#   worker:
+#     pollingInterval: 15
+#     cooldownPeriod: 300
+#     minReplicaCount: 3
+#     maxReplicaCount: 50
+#     triggers:
+#       - type: redis
+#         metadata:
+#           address: ""                # Auto-derived from redis config
+#           listName: "bull:default:wait"
+#           listLength: "5"
+#         authenticationRef:
+#           name: "n8n-keda-redis-auth"
+#   webhookProcessor:
+#     enabled: true
+#     pollingInterval: 15
+#     cooldownPeriod: 120
+#     minReplicaCount: 3
+#     maxReplicaCount: 20
+#     triggers: []
+
+# -----------------------------------------------------------------------------
+# 11. SERVICE - ClusterIP (behind AppGW + nginx-ingress)
+# -----------------------------------------------------------------------------
+# Service is ClusterIP because AppGW + nginx-ingress handle external traffic.
+# No external LoadBalancer needed for the n8n service itself.
+# deploy.sh enforces this via --set service.type=ClusterIP.
+service:
+  type: ClusterIP
+  port: 5678
+  sessionAffinity:
+    enabled: true
+    timeoutSeconds: 10800              # 3 hours - important for WebSocket stability
+
+# -----------------------------------------------------------------------------
+# 12. INGRESS - NGINX (TLS termination at ingress)
+# -----------------------------------------------------------------------------
+# Ingress is ENABLED when N8N_DOMAIN is set in .env.
+# deploy.sh passes --set ingress.enabled=<true|false> based on .env state.
+#
+# PREREQUISITES before activating (N8N_DOMAIN set):
+#   1. NGINX ingress controller installed in cluster:
+#        helm install ingress-nginx ingress-nginx/ingress-nginx \
+#          -n ingress-nginx --create-namespace
+#   2. TLS cert loaded as K8s secret in n8n namespace:
+#        kubectl create secret tls n8n-tls \
+#          --cert=fullchain.pem --key=privkey.pem -n n8n
+#   3. DNS A record: <N8N_DOMAIN> → ingress controller LB IP
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: false                           # Flipped to true by deploy.sh when N8N_DOMAIN is set
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
+    # WebSocket support (required for n8n editor push updates)
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    # Session affinity at ingress level (complements service-level stickiness)
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "n8n-route"
+    nginx.ingress.kubernetes.io/session-cookie-expires: "10800"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "10800"
+  hosts:
+    - host: "<N8N_DOMAIN>"
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: "<N8N_TLS_SECRET_NAME>"
+      hosts:
+        - "<N8N_DOMAIN>"
+
+  # --- Dedicated webhook-processor ingress (production webhook routing) ---------
+  # Main pods have production webhooks DISABLED (§3 disableProductionWebhooksOnMainProcess:
+  # true), so production webhooks MUST reach the webhook-processor pods — not main.
+  # The chart's templates/ingress-webhook.yaml creates a SECOND Ingress that routes
+  # /webhook/ and /webhook-waiting/ (Prefix) to the <release>-webhook-processor service,
+  # but ONLY when BOTH webhookProcessor.enabled (§9) AND ingress.webhookProcessor.enabled
+  # are true. deploy.sh flips 'enabled' true together with the main ingress (when
+  # N8N_DOMAIN is set). It reuses ingress.hosts + service.port.
+  # ⚠ Needs an ingress + hostname. In DEV port-forward mode (no N8N_DOMAIN) there is no
+  # ingress at all — route production webhooks by port-forwarding the
+  # <release>-webhook-processor service directly (see docs/HANDOVER.md webhook note).
+  webhookProcessor:
+    enabled: false                          # deploy.sh sets true when N8N_DOMAIN is set
+    className: nginx
+    annotations:
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+      nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    tls:
+      - secretName: "<N8N_TLS_SECRET_NAME>"
+        hosts:
+          - "<N8N_DOMAIN>"
+
+# -----------------------------------------------------------------------------
+# RBAC
+# -----------------------------------------------------------------------------
+rbac:
+  create: true
+
+# -----------------------------------------------------------------------------
+# 13. SERVICE ACCOUNT - Azure Workload Identity
+# -----------------------------------------------------------------------------
+serviceAccount:
+  create: false                        # We pre-create it in deploy.sh Phase 8
+  name: n8n-enterprise
+  # No annotations needed — KV access is via AKS kubelet identity (node-level),
+  # not pod-level Workload Identity.
+
+# -----------------------------------------------------------------------------
+# 14. RESOURCE LIMITS
+# -----------------------------------------------------------------------------
+resources:
+  main:
+    requests:
+      memory: "2Gi"
+      cpu: "1000m"
+    limits:
+      memory: "4Gi"
+      cpu: "2000m"
+  worker:
+    requests:
+      memory: "1Gi"
+      cpu: "500m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"
+  webhookProcessor:
+    requests:
+      memory: "512Mi"
+      cpu: "300m"
+    limits:
+      memory: "1Gi"
+      cpu: "800m"
+
+# -----------------------------------------------------------------------------
+# 15. SECRETS - Reference pre-created K8s secrets
+# -----------------------------------------------------------------------------
+# n8n-core-secrets contains ONLY N8N_ENCRYPTION_KEY (the only true secret).
+# The chart still injects N8N_HOST/PORT/PROTOCOL as env vars from this map
+# (chart-level convention, even when existingSecret is set). N8N_PROTOCOL is
+# parameterized via <N8N_PROTOCOL> placeholder so it stays in sync with .env.
+secretRefs:
+  existingSecret: "n8n-core-secrets"   # Populated by KeyVault CSI driver
+  env:
+    N8N_ENCRYPTION_KEY: "replaced-by-keyvault"   # Only ACTUAL secret in this bundle
+# Note: N8N_HOST, N8N_PORT, N8N_PROTOCOL aren't listed above because the chart's
+# coreSecretsEnv helper injects them unconditionally via secretKeyRef against this
+# same "n8n-core-secrets" Secret. seed-keyvault.sh writes n8n-host/n8n-port/n8n-protocol
+# into KeyVault; azure/secret-provider-class.yaml syncs them into this Secret under
+# keys N8N_HOST/N8N_PORT/N8N_PROTOCOL. They must NOT be re-added in config.extraEnv
+# below (see the "do NOT add them here" warning there) — that would duplicate the env var.
+
+# -----------------------------------------------------------------------------
+# 16. LIFECYCLE HOOKS (Graceful shutdown)
+# -----------------------------------------------------------------------------
+lifecycle:
+  main:
+    terminationGracePeriodSeconds: 60
+    preStop:
+      enabled: true
+      command:
+        - "/bin/sh"
+        - "-c"
+        - "sleep 10"
+  worker:
+    terminationGracePeriodSeconds: 120  # Longer for workers to finish executions
+    preStop:
+      enabled: true
+      command:
+        - "/bin/sh"
+        - "-c"
+        - "sleep 10"
+  webhookProcessor:
+    terminationGracePeriodSeconds: 60
+    preStop:
+      enabled: true
+      command:
+        - "/bin/sh"
+        - "-c"
+        - "sleep 10"
+
+# -----------------------------------------------------------------------------
+# 17. EXECUTION SETTINGS
+# -----------------------------------------------------------------------------
+# These chart fields directly drive env vars in the n8n container.
+# Do NOT also set the same env vars in config.extraEnv — Helm errors with
+# "duplicate entries" if both this section and extraEnv set them.
+executions:
+  concurrency:
+    productionLimit: -1                # n8n default: unlimited. Add cap only if real load proves it's needed.
+  timeout: 7200                        # 2 hours max per execution
+  timeoutMax: 7200                     # Max timeout users can set
+  data:
+    saveOnError: "all"
+    saveOnSuccess: "all"
+    saveOnProgress: false
+    saveManualExecutions: true
+  pruning:
+    enabled: true                      # → EXECUTIONS_DATA_PRUNE
+    maxAge: 336                        # n8n default: 14 days → EXECUTIONS_DATA_MAX_AGE
+    maxCount: 10000                    # n8n default → EXECUTIONS_DATA_PRUNE_MAX_COUNT
+    hardDeleteBuffer: 24
+    hardDeleteInterval: 15
+    softDeleteInterval: 60
+
+# -----------------------------------------------------------------------------
+# 18. WEBHOOK SETTINGS
+# -----------------------------------------------------------------------------
+webhook:
+  enabled: true
+  url: "<N8N_BASE_URL>/"               # → WEBHOOK_URL (auto-derived: https://<domain>/ or http://<LB-IP>:5678/)
+  timeout: 300000                      # 5 minutes
+
+# -----------------------------------------------------------------------------
+# 19. PROBES
+# -----------------------------------------------------------------------------
+probes:
+  liveness:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 60
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 5
+  readiness:
+    enabled: true
+    path: /healthz/readiness
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  # Worker probes (workers don't have HTTP endpoints - use exec)
+  worker:
+    readiness:
+      enabled: true
+      type: "exec"
+      command:
+        - "/bin/sh"
+        - "-c"
+        - "pgrep -f 'n8n worker' > /dev/null"
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 6
+    liveness:
+      enabled: true
+      type: "exec"
+      command:
+        - "/bin/sh"
+        - "-c"
+        - "pgrep -f 'n8n worker' > /dev/null"
+      initialDelaySeconds: 60
+      periodSeconds: 30
+      timeoutSeconds: 5
+      failureThreshold: 3
+
+# -----------------------------------------------------------------------------
+# 20. SECURITY CONTEXT
+# -----------------------------------------------------------------------------
+securityContext:
+  enabled: true
+  fsGroup: 1000
+  runAsUser: 1000
+  runAsGroup: 1000
+
+# -----------------------------------------------------------------------------
+# 21. POD DISRUPTION BUDGET
+# -----------------------------------------------------------------------------
+pdb:
+  enabled: true
+  minAvailable: 2
+
+# -----------------------------------------------------------------------------
+# 22. NETWORK POLICY
+# -----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true                        # Chart creates default allow-n8n-components policy
+
+# -----------------------------------------------------------------------------
+# 21b. CUSTOM CA TRUST — trust the internal CA for internal HTTPS (Azure OpenAI APIM)
+# -----------------------------------------------------------------------------
+# Azure OpenAI (via the ai-hub-gateway APIM domain) and other internal endpoints
+# present certificates signed by an INTERNAL CA that Node.js does not trust by
+# default. AI/LangChain nodes can't skip TLS validation like the HTTP Request node
+# can, so we make the runtime trust the CA (see NODE_EXTRA_CA_CERTS below).
+#
+# n8n's documented, secure approach (v1.42.0+):
+#   https://docs.n8n.io/deploy/host-n8n/configure-n8n/basic-configuration/configuration-examples/configure-custom-ssl-certificate-authorities/
+# We use the underlying NODE_EXTRA_CA_CERTS mechanism because this chart has no
+# init-container support (n8n's /opt/custom-certificates route needs a writable dir).
+#
+# The CA file comes from .env (CUSTOM_CA_CERT_PATH); deploy.sh loads it into the
+# 'n8n-ca-bundle' ConfigMap as ca-bundle.pem. These TOP-LEVEL keys are wired by the
+# chart into main + worker + webhook pods, so trust applies everywhere workflows run.
+extraVolumes:
+  - name: n8n-ca-bundle
+    configMap:
+      name: n8n-ca-bundle
+extraVolumeMounts:
+  - name: n8n-ca-bundle
+    mountPath: /etc/ssl/n8n-ca
+    readOnly: true
+
+# -----------------------------------------------------------------------------
+# 23. N8N CONFIG & ENVIRONMENT OVERRIDES
+# -----------------------------------------------------------------------------
+config:
+  timezone: "<N8N_TIMEZONE>"           # Chart renders this as TZ = container system clock ONLY
+  extraEnv:
+    # N8N_HOST/PORT/PROTOCOL ARE auto-injected by the chart (via coreSecretsEnv) — do NOT
+    # re-add them here (Helm "duplicate env var" error).
+    # GENERIC_TIMEZONE is NOT injected by the chart, and n8n does NOT derive it from TZ — it
+    # defaults to America/New_York. Without it, every Schedule/Cron Trigger evaluates in
+    # America/New_York, not Asia/Dubai (~8-9h off). So we MUST set it explicitly here.
+    - name: GENERIC_TIMEZONE
+      value: "<N8N_TIMEZONE>"
+    - name: N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS
+      value: "true"
+
+    # --- Trust the internal CA (Azure OpenAI APIM gateway + all internal HTTPS) ---
+    # AI/LangChain nodes have NO "Ignore SSL Issues" toggle, so we add the internal CA
+    # to Node's trust store. The CA comes from .env (CUSTOM_CA_CERT_PATH); deploy.sh
+    # mounts it as /etc/ssl/n8n-ca/ca-bundle.pem via the top-level extraVolumes above.
+    # n8n's documented, SECURE method — never use NODE_TLS_REJECT_UNAUTHORIZED=0
+    # outside a throwaway DEV test.
+    - name: NODE_EXTRA_CA_CERTS
+      value: "/etc/ssl/n8n-ca/ca-bundle.pem"
+
+    # Structured JSON logs (use N8N_LOG_FORMAT, not the destination-only _OUTPUT).
+    - name: N8N_LOG_LEVEL
+      value: "info"
+    - name: N8N_LOG_FORMAT
+      value: "json"
+
+    # NOTE: N8N_EDITOR_BASE_URL is auto-set by chart v1.10.1 (from the domain /
+    # webhook.url config) — do NOT set it here or Helm fails with "duplicate env".
+    # (Older charts didn't set it; removed when upgrading 1.5→1.10.)
+
+    # --- Security hardening ---
+    # Block workflows from reading server env vars (DB passwords, API keys).
+    - name: N8N_BLOCK_ENV_ACCESS_IN_NODE
+      value: "true"
+    # Block workflows from reading n8n's own config/data directory.
+    - name: N8N_BLOCK_FILE_ACCESS_TO_N8N_FILES
+      value: "true"
+
+    # --- SSRF egress control — CURRENTLY OPEN (allow all) ---
+    # See docs/RESTRICTIONS-INVENTORY.md for the loosen/tighten values.
+    # To re-tighten: set PROTECTION_ENABLED "true" and restore the Microsoft/
+    # Azure/org allowlists (preserved in RESTRICTIONS-INVENTORY.md §1). Latest docs add
+    # a block model too — N8N_SSRF_BLOCKED_IP_RANGES="default" (n8n's built-in bad ranges)
+    # and N8N_SSRF_BLOCKED_HOSTNAMES — an allow entry always overrides a block.
+    - name: N8N_SSRF_PROTECTION_ENABLED
+      value: "false"                     # ALLOW ALL — "true" re-enables the allowlists below
+    - name: N8N_SSRF_ALLOWED_HOSTNAMES
+      value: "*"                         # ALL hosts (inert while protection=false)
+    - name: N8N_SSRF_ALLOWED_IP_RANGES
+      value: "0.0.0.0/0"                 # ALL IPs (inert while protection=false)
+
+    # --- Node allow-list (NODES_INCLUDE) — TEAM-APPROVED list, 2026-07-10 ---
+    # CURRENTLY ENABLED (enforced 2026-07-14) → only the 96 listed nodes load;
+    # everything else is hidden. Same approved list as DEV/UAT, so a workflow built
+    # in DEV imports cleanly into PROD. To go back to "all nodes", comment BOTH
+    # lines below (`- name:` + `value:`) and redeploy.
+    #
+    # WHERE this lives: ONLY here (config.extraEnv NODES_INCLUDE in this file).
+    # deploy.sh renders this file as-is — there is NO node list anywhere else.
+    #
+    # HOW to add / remove a node in future:
+    #   1. Mark it [x] (or unmark) in docs/NODE-INVENTORY-FOR-REVIEW.txt — that file
+    #      is the human review/approval checklist (the governance gate).
+    #   2. Get the node's EXACT type id: add it in the n8n UI -> download the workflow
+    #      JSON -> copy the "type" field. Do NOT guess the id.
+    #   3. Add / remove that id in the JSON array on the `value:` line below.
+    #   4. Redeploy:  ./scripts/deploy.sh   (this redeploy IS the change-control gate.)
+    # Pair with N8N_SSRF_ALLOWED_HOSTNAMES (egress) for a true "only X" policy — hide
+    # the node AND block its destination. Re-review quarterly + after each n8n upgrade
+    # (new core nodes ship every release). See docs/RESTRICTIONS-INVENTORY.md §1.
+    #
+    # This list = the team's approved [x] picks: 96 nodes = 50 core + 10 vendor
+    # (MS Teams/Excel/OneDrive/SharePoint + Azure Storage + Postgres + SMTP) + 36 AI
+    # (Azure-OpenAI-only stack). Deprecated/[DANGER]/extra-Microsoft/extra-DB nodes are
+    # intentionally excluded per the team review.
+    - name: NODES_INCLUDE
+      value: '["n8n-nodes-base.manualTrigger","n8n-nodes-base.scheduleTrigger","n8n-nodes-base.webhook","n8n-nodes-base.formTrigger","n8n-nodes-base.form","n8n-nodes-base.errorTrigger","n8n-nodes-base.n8nTrigger","n8n-nodes-base.executeWorkflowTrigger","n8n-nodes-base.sseTrigger","n8n-nodes-base.emailReadImap","n8n-nodes-base.if","n8n-nodes-base.switch","n8n-nodes-base.merge","n8n-nodes-base.filter","n8n-nodes-base.splitInBatches","n8n-nodes-base.stopAndError","n8n-nodes-base.noOp","n8n-nodes-base.set","n8n-nodes-base.code","n8n-nodes-base.aiTransform","n8n-nodes-base.dateTime","n8n-nodes-base.aggregate","n8n-nodes-base.limit","n8n-nodes-base.removeDuplicates","n8n-nodes-base.splitOut","n8n-nodes-base.sort","n8n-nodes-base.summarize","n8n-nodes-base.compareDatasets","n8n-nodes-base.crypto","n8n-nodes-base.jwt","n8n-nodes-base.totp","n8n-nodes-base.httpRequest","n8n-nodes-base.graphql","n8n-nodes-base.respondToWebhook","n8n-nodes-base.executeWorkflow","n8n-nodes-base.wait","n8n-nodes-base.dataTable","n8n-nodes-base.convertToFile","n8n-nodes-base.extractFromFile","n8n-nodes-base.html","n8n-nodes-base.xml","n8n-nodes-base.markdown","n8n-nodes-base.compression","n8n-nodes-base.editImage","n8n-nodes-base.iCal","n8n-nodes-base.stickyNote","n8n-nodes-base.n8n","n8n-nodes-base.executionData","n8n-nodes-base.rssFeedRead","n8n-nodes-base.rssFeedReadTrigger","n8n-nodes-base.microsoftTeams","n8n-nodes-base.microsoftTeamsTrigger","n8n-nodes-base.microsoftExcel","n8n-nodes-base.microsoftOneDrive","n8n-nodes-base.microsoftOneDriveTrigger","n8n-nodes-base.microsoftSharePoint","n8n-nodes-base.azureStorage","n8n-nodes-base.postgres","n8n-nodes-base.postgresTrigger","n8n-nodes-base.emailSend","@n8n/n8n-nodes-langchain.agent","@n8n/n8n-nodes-langchain.agentTool","@n8n/n8n-nodes-langchain.chainLlm","@n8n/n8n-nodes-langchain.chainRetrievalQa","@n8n/n8n-nodes-langchain.chainSummarization","@n8n/n8n-nodes-langchain.informationExtractor","@n8n/n8n-nodes-langchain.sentimentAnalysis","@n8n/n8n-nodes-langchain.textClassifier","@n8n/n8n-nodes-langchain.lmChatAzureOpenAi","@n8n/n8n-nodes-langchain.embeddingsAzureOpenAi","@n8n/n8n-nodes-langchain.memoryBufferWindow","@n8n/n8n-nodes-langchain.memoryManager","@n8n/n8n-nodes-langchain.memoryChatRetriever","@n8n/n8n-nodes-langchain.memoryPostgresChat","@n8n/n8n-nodes-langchain.outputParserStructured","@n8n/n8n-nodes-langchain.outputParserAutofixing","@n8n/n8n-nodes-langchain.outputParserItemList","@n8n/n8n-nodes-langchain.textSplitterRecursiveCharacterTextSplitter","@n8n/n8n-nodes-langchain.textSplitterCharacterTextSplitter","@n8n/n8n-nodes-langchain.textSplitterTokenSplitter","@n8n/n8n-nodes-langchain.documentDefaultDataLoader","@n8n/n8n-nodes-langchain.toolCalculator","@n8n/n8n-nodes-langchain.toolCode","@n8n/n8n-nodes-langchain.toolHttpRequest","@n8n/n8n-nodes-langchain.toolWorkflow","@n8n/n8n-nodes-langchain.toolVectorStore","@n8n/n8n-nodes-langchain.toolThink","@n8n/n8n-nodes-langchain.retrieverVectorStore","@n8n/n8n-nodes-langchain.retrieverContextualCompression","@n8n/n8n-nodes-langchain.retrieverMultiQuery","@n8n/n8n-nodes-langchain.vectorStoreInMemory","@n8n/n8n-nodes-langchain.vectorStoreAzureAISearch","@n8n/n8n-nodes-langchain.vectorStorePGVector","@n8n/n8n-nodes-langchain.chatTrigger","@n8n/n8n-nodes-langchain.manualChatTrigger","@n8n/n8n-nodes-langchain.mcpClientTool"]'
+
+    # Disable public REST API + Swagger UI (independent flags per n8n docs).
+    - name: N8N_PUBLIC_API_DISABLED
+      value: "true"
+    - name: N8N_PUBLIC_API_SWAGGERUI_DISABLED
+      value: "true"
+
+    # Block community (third-party) node packages; don't load any pre-installed.
+    - name: N8N_COMMUNITY_PACKAGES_ENABLED
+      value: "false"
+    - name: N8N_COMMUNITY_PACKAGES_PREVENT_LOADING
+      value: "true"
+
+    # Cookie hardening (strict SameSite, secure flag).
+    - name: N8N_SECURE_COOKIE
+      value: "true"
+    - name: N8N_SAMESITE_COOKIE
+      value: "strict"
+
+    # Confine workflow file access to one directory.
+    - name: N8N_RESTRICT_FILE_ACCESS_TO
+      value: "/home/node/.n8n-files"
+
+    # --- Code-node sandboxing ---
+    # With EXTERNAL task runners (our setup), NODE_FUNCTION_ALLOW_BUILTIN /
+    # NODE_FUNCTION_ALLOW_EXTERNAL and the Python allow/deny lists are enforced in the
+    # runner launcher JSON (azure/n8n-task-runners.json → taskRunners.customConfig),
+    # NOT via container env vars — setting them here would be INERT. Allowed JS builtins
+    # (crypto,buffer,url,querystring,util,zlib), no external modules, and locked-down
+    # Python are all defined there instead.
+    - name: N8N_PYTHON_ENABLED
+      value: "true"                      # enables Python; the sandbox lives in the runner JSON
+
+    # Git node hardening — no bare-repo clones, no hooks (RCE on malicious repo).
+    - name: N8N_GIT_NODE_DISABLE_BARE_REPOS
+      value: "true"
+    - name: N8N_GIT_NODE_ENABLE_HOOKS
+      value: "false"
+
+    # Content Security Policy — DISABLED (helmet.js needs CSP keywords single-
+    # quoted, e.g. ["'self'"]). Working format preserved in RESTRICTIONS-INVENTORY.md
+    # / git history. Verify the UI loads with no console CSP errors before re-enabling.
+    # - name: N8N_CONTENT_SECURITY_POLICY
+    #   value: '{"default-src":["''self''"],"script-src":["''self''","''unsafe-inline''","''unsafe-eval''"],"style-src":["''self''","''unsafe-inline''"],"img-src":["''self''","data:","https:"],"connect-src":["''self''","ws:","wss:"],"font-src":["''self''","data:"],"frame-ancestors":["''none''"],"object-src":["''none''"]}'
+
+    # --- Instance governance locks (*_MANAGED_BY_ENV — UI controls go read-only) ---
+    # These settings have UI toggles; setting MANAGED_BY_ENV=true forces our value
+    # AND locks the UI so an Admin can't weaken it at runtime (change-control only).
+    # Docs: docs.n8n.io/hosting/configuration/settings-env-vars/
+    #
+    # MCP server access — OFF + locked (don't expose n8n to external AI agents).
+    - name: N8N_MCP_ACCESS_ENABLED
+      value: "false"
+    - name: N8N_MCP_MANAGED_BY_ENV
+      value: "true"
+    #
+    # Security policy — locked. Personal-space sharing/publishing OFF (no shadow
+    # IT / public workflows). MFA enforcement OFF here because MFA is handled
+    # upstream by Azure AD + PingID (n8n local MFA is disabled — see N8N_MFA_ENABLED).
+    - name: N8N_SECURITY_POLICY_MANAGED_BY_ENV
+      value: "true"
+    - name: N8N_MFA_ENFORCED_ENABLED
+      value: "false"                     # MFA via PingID upstream, not n8n-local
+    - name: N8N_PERSONAL_SPACE_SHARING_ENABLED
+      value: "false"                     # block sharing from personal space (use projects)
+    - name: N8N_PERSONAL_SPACE_PUBLISHING_ENABLED
+      value: "false"                     # block public publishing of workflows
+    # Note: community packages need no MANAGED_BY_ENV lock — N8N_COMMUNITY_PACKAGES_
+    # ENABLED=false already removes the install UI entirely (MANAGED_BY_ENV is
+    # ignored when packages are disabled).
+
+    # --- Queue mode ---
+    # Chart auto-sets N8N_CONCURRENCY_PRODUCTION_LIMIT, OFFLOAD_MANUAL_EXECUTIONS_
+    # TO_WORKERS, N8N_GRACEFUL_SHUTDOWN_TIMEOUT — do NOT duplicate them here.
+    # Worker health endpoint for K8s probes.
+    # ⚠️ TRIPWIRE: if you set redis.healthCheck.enabled=true, the chart injects
+    # QUEUE_HEALTH_CHECK_ACTIVE itself — remove this line then.
+    - name: QUEUE_HEALTH_CHECK_ACTIVE
+      value: "true"
+    # Redis cluster mode — off (standalone client works for single-shard OSS).
+    # - name: QUEUE_BULL_REDIS_CLUSTER_NODES
+    #   value: "<AZURE_REDIS_HOST>:<AZURE_REDIS_PORT>"
+
+    # --- External data storage (binary + execution data) ---
+    # Modes are auto-derived by deploy.sh from .env's AZURE_STORAGE_ACCOUNT (default
+    # "database", so the CURRENT deploy is unchanged if it's left empty). To offload
+    # large payloads OUT of PostgreSQL into Azure Blob: provision the storage account
+    # (only the account itself — deploy.sh does the rest), set AZURE_STORAGE_ACCOUNT
+    # in .env, and re-deploy — deploy.sh Phase 5b automatically grants the kubelet
+    # identity "Storage Blob Data Contributor" on the account AND creates the target
+    # container if it doesn't exist yet. No manual IAM step, no manual container
+    # creation. Azure Blob binary/execution storage is Enterprise-licensed. n8n
+    # delegates binary-data pruning to Azure — set a container lifecycle policy.
+    # N8N_AVAILABLE_BINARY_DATA_MODES intentionally NOT set — deprecated in
+    # n8n >= 2.29 (runtime warns "Remove this environment variable").
+    - name: N8N_DEFAULT_BINARY_DATA_MODE
+      value: "<BINARY_DATA_MODE>"
+    - name: N8N_EXECUTION_DATA_STORAGE_MODE
+      value: "<EXECUTION_DATA_STORAGE_MODE>"
+    # Azure Blob target + MANAGED-IDENTITY auth (AUTH_AUTO_DETECT → DefaultAzureCredential).
+    # This is n8n's "best for production on Azure" path — no account key stored anywhere.
+    # AZURE_CLIENT_ID pins the kubelet user-assigned identity so IMDS is unambiguous on
+    # nodes carrying more than one identity. Container must already exist (n8n does NOT
+    # create it) and match AZURE_STORAGE_CONTAINER; binary + execution data share it.
+    # REQUIRES azure/networkpolicy-imds.yaml — the chart's NetworkPolicy blocks the IMDS
+    # token endpoint (169.254.169.254:80), which otherwise makes token acquisition time out
+    # ("Failed to connect to Azure Blob storage"). deploy.sh applies that policy in azure
+    # mode. See docs/HANDOVER.md §6.3.1.
+    - name: N8N_EXTERNAL_STORAGE_AZURE_ACCOUNT_NAME
+      value: "<AZURE_STORAGE_ACCOUNT>"
+    - name: N8N_EXTERNAL_STORAGE_AZURE_CONTAINER_NAME
+      value: "<AZURE_STORAGE_CONTAINER>"
+    - name: N8N_EXTERNAL_STORAGE_AZURE_AUTH_AUTO_DETECT
+      value: "true"
+    - name: AZURE_CLIENT_ID
+      value: "<POD_IDENTITY_CLIENT_ID>"
+
+    # --- Networking / DB ---
+    # Proxy hops: Browser → AppGW → nginx-ingress → n8n = 2.
+    - name: N8N_PROXY_HOPS
+      value: "2"
+    # Max payload (MiB) — match nginx proxy-body-size (default 16 → 413 above that).
+    - name: N8N_PAYLOAD_SIZE_MAX
+      value: "100"
+    # Postgres SSL on. (rejectUnauthorized is chart-controlled via §6 — don't set
+    # DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED here or Helm errors on duplicate env.)
+    - name: DB_POSTGRESDB_SSL_ENABLED
+      value: "true"
+    # Connection pool — n8n default 2 is too low for queue mode + multi-main.
+    - name: DB_POSTGRESDB_POOL_SIZE
+      value: "20"
+    # Workflow edit history retention — 90 days (chart handles execution pruning).
+    - name: N8N_WORKFLOW_HISTORY_PRUNE_TIME
+      value: "2160"
+
+    # --- Prometheus metrics ---
+    - name: N8N_METRICS
+      value: "true"
+    - name: N8N_METRICS_INCLUDE_DEFAULT_METRICS
+      value: "true"
+    - name: N8N_METRICS_INCLUDE_WORKFLOW_ID_LABEL
+      value: "true"
+    - name: N8N_METRICS_INCLUDE_NODE_TYPE_LABEL
+      value: "true"
+    - name: N8N_METRICS_INCLUDE_API_ENDPOINTS
+      value: "true"
+    - name: N8N_METRICS_INCLUDE_QUEUE_METRICS
+      value: "true"
+    # Added from docs audit: cache hit/miss + SSRF-protection check metrics.
+    - name: N8N_METRICS_INCLUDE_CACHE_METRICS
+      value: "true"
+    - name: N8N_METRICS_INCLUDE_SSRF_METRICS
+      value: "true"
+
+    # --- Outbound calls to n8n's servers ---
+    - name: N8N_VERSION_NOTIFICATIONS_ENABLED
+      value: "true"                      # DEV: true | PROD: false
+    - name: N8N_DIAGNOSTICS_ENABLED
+      value: "false"                     # no telemetry (all envs)
+    - name: N8N_TEMPLATES_ENABLED
+      value: "true"                      # DEV: true | PROD: false
+    - name: N8N_HIRING_BANNER_ENABLED
+      value: "false"
+    - name: N8N_PERSONALIZATION_ENABLED
+      value: "false"
+
+    # --- Hardening + observability (added from the latest-docs audit) ---
+    # WAF-friendly outbound User-Agent that does NOT leak the n8n version to upstream
+    # (APIM, firewalls). ⚠️ Changes the UA on ALL outbound calls — verify APIM / Azure
+    # OpenAI still respond after enabling.
+    - name: N8N_ENFORCE_GLOBAL_USER_AGENT
+      value: "true"
+    - name: N8N_GLOBAL_USER_AGENT_VALUE
+      value: "Mozilla/5.0 (compatible; n8n; +https://n8n.io/)"
+    # Insights (analytics) runs by default and writes to Postgres. Bound its growth:
+    # keep 180 days of compacted data (max 730). Disable entirely: N8N_DISABLED_MODULES=insights.
+    - name: N8N_INSIGHTS_MAX_AGE_DAYS
+      value: "180"
+    # Encryption-key rotation capability. Kept OFF — enabling is a ONE-WAY change and
+    # requires a full DB backup first + this=true on ALL pods. Turn on only as a planned,
+    # change-controlled rotation. Docs: security/rotate-encryption-keys.
+    - name: N8N_ENV_FEAT_ENCRYPTION_KEY_ROTATION
+      value: "false"
+
+    # --- SSO / SAML (Azure AD + PingID) — ACTIVE ---
+    # IdP metadata (cert, SSO URL, entity ID) is configured in Settings > SSO
+    # (stored in Postgres), not here. Full setup + break-glass in
+    # docs/AUTH-SAML-RUNBOOK.md.
+    # ⚠️ BREAK-GLASS: at least one Owner must have "Allow Manual Login" enabled
+    # (Settings > Users) before every deploy — the only fallback if SAML breaks.
+    - name: N8N_SSO_SAML_LOGIN_ENABLED
+      value: "true"
+    - name: N8N_SSO_SAML_LOGIN_LABEL
+      value: "<N8N_SSO_LOGIN_LABEL>"
+    # JIT user creation on first SAML login.
+    - name: N8N_SSO_JUST_IN_TIME_PROVISIONING
+      value: "true"
+    # Auto-redirect /signin to PingID (no n8n login form).
+    - name: N8N_SSO_REDIRECT_LOGIN_TO_SSO
+      value: "true"
+    # Instance role from AD group claim (AD group → n8n role, every login).
+    - name: N8N_SSO_SCOPES_PROVISION_INSTANCE_ROLE
+      value: "true"
+    - name: N8N_SSO_SCOPES_INSTANCE_ROLE_CLAIM_NAME
+      value: "n8n_instance_role"
+    # Project roles assigned manually in UI (not via claim).
+    - name: N8N_SSO_SCOPES_PROVISION_PROJECT_ROLES
+      value: "false"
+    # Local 2FA off — MFA handled upstream by Azure AD + PingID (avoid double-prompt).
+    - name: N8N_MFA_ENABLED
+      value: "false"
+    # Session duration: 2h, with silent refresh disabled below, so users must
+    # re-authenticate after 2 hours. n8n default is 168h.
+    - name: N8N_USER_MANAGEMENT_JWT_DURATION_HOURS
+      value: "2"
+    # Token refresh: 0 = auto-refresh at 25% of duration (silent). Set to -1 in PROD to
+    # DISABLE silent refresh → users must re-authenticate after the duration above.
+    - name: N8N_USER_MANAGEMENT_JWT_REFRESH_TIMEOUT_HOURS
+      value: "-1"                         # PROD: -1 (force re-login, no silent refresh)
+
+    # --- SMTP (uncomment when configured in Key Vault; see seed-keyvault.sh) ---
+    #
+    # - name: N8N_SMTP_HOST
+    #   value: "<smtp-host>"             # e.g. smtp.office365.com
+    # - name: N8N_SMTP_PORT
+    #   value: "587"
+    # - name: N8N_SMTP_USER
+    #   value: "<smtp-user>"             # e.g. n8n-noreply@example.com
+    # - name: N8N_SMTP_SENDER
+    #   value: "<smtp-sender>"           # e.g. n8n-noreply@example.com
+    # - name: N8N_SMTP_SSL
+    #   value: "true"
+    # - name: N8N_SMTP_PASS
+    #   valueFrom:
+    #     secretKeyRef:
+    #       name: n8n-smtp-secret
+    #       key: password
+
+# -----------------------------------------------------------------------------
+# 24. MONITORING (Prometheus - enable if you have Prometheus stack)
+# -----------------------------------------------------------------------------
+# monitoring:
+#   enabled: true
+#   serviceMonitor:
+#     enabled: true
+#     interval: 30s
+#     scrapeTimeout: 10s
+#   prometheusRule:
+#     enabled: true

@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: n8n-custom-ca
+  namespace: n8n
+data:
+  ca-bundle.pem: |
+    # PLACEHOLDER: deploy.sh populates this from CUSTOM_CA_CERT_PATH.
+    # Do not commit private certificates or keys.

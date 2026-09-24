@@ -1,0 +1,109 @@
+# =============================================================================
+# n8n Security Audit — Quarterly CronJob
+# =============================================================================
+# Runs `n8n audit` inside the cluster on a quarterly schedule. Output goes to
+# pod logs → Azure Monitor Container Insights for review.
+#
+# Deploy:
+#   kubectl apply -f azure/security-audit-cronjob.yaml -n n8n
+#
+# Manual trigger:
+#   kubectl create job --from=cronjob/n8n-security-audit n8n-security-audit-manual -n n8n
+#
+# View output:
+#   kubectl logs -n n8n -l job-name=n8n-security-audit-XXXXX
+#   OR via Log Analytics:
+#     ContainerLogV2
+#     | where Namespace == "n8n"
+#     | where ContainerName == "n8n-audit"
+#     | order by TimeGenerated desc
+#
+# Source: https://docs.n8n.io/hosting/securing/security-audit/
+# =============================================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: n8n-security-audit
+  namespace: n8n
+  labels:
+    app: n8n
+    component: security-audit
+spec:
+  # Quarterly: 1st of Jan/Apr/Jul/Oct at 02:00 UTC
+  schedule: "0 2 1 1,4,7,10 *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 4    # Keep last 4 quarters
+  failedJobsHistoryLimit: 4
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 7776000  # 90 days
+      template:
+        metadata:
+          labels:
+            app: n8n
+            component: security-audit
+        spec:
+          restartPolicy: Never
+          serviceAccountName: n8n-enterprise
+          containers:
+            - name: n8n-audit
+              # Use the same n8n image as the main pods. Image repo + tag
+              # injected by deploy.sh via --set when deploying.
+              # If applying manually, set image to match what main pods use.
+              image: docker.io/n8nio/n8n:2.27.3
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  echo "=== n8n Security Audit — $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+                  n8n audit
+                  echo "=== Audit complete ==="
+              env:
+                # Database connection — same as main pods (reused via secrets)
+                - name: DB_TYPE
+                  value: "postgresdb"
+                - name: DB_POSTGRESDB_HOST
+                  valueFrom:
+                    configMapKeyRef:
+                      name: n8n-enterprise          # chart ConfigMap (release fullname)
+                      key: DB_POSTGRESDB_HOST
+                - name: DB_POSTGRESDB_DATABASE
+                  valueFrom:
+                    configMapKeyRef:
+                      name: n8n-enterprise
+                      key: DB_POSTGRESDB_DATABASE
+                - name: DB_POSTGRESDB_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: n8n-db-secret
+                      key: app-user
+                - name: DB_POSTGRESDB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: n8n-db-secret
+                      key: app-password
+                - name: DB_POSTGRESDB_SSL_ENABLED
+                  value: "true"
+                - name: DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED
+                  value: "false"
+                - name: N8N_ENCRYPTION_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: n8n-core-secrets
+                      key: N8N_ENCRYPTION_KEY
+              resources:
+                requests:
+                  memory: "256Mi"
+                  cpu: "100m"
+                limits:
+                  memory: "512Mi"
+                  cpu: "500m"
+              securityContext:
+                runAsUser: 1000
+                runAsGroup: 1000
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: false
+                capabilities:
+                  drop: ["ALL"]

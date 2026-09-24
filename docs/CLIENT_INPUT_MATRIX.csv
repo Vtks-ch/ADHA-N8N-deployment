@@ -1,0 +1,32 @@
+Category,Parameter,DEV,UAT,PROD,Owner,Required Before Terraform
+Azure,Subscription ID,,,,Client,Yes
+Azure,Region,,,,Client,Yes
+Azure,Tenant ID,,,,Client,Yes
+Azure,Resource naming standard,,,,Client,Yes
+Network,VNet CIDR,,,,Network,Yes
+Network,AKS subnet CIDR,,,,Network,Yes
+Network,Private Endpoint subnet CIDR,,,,Network,Yes
+Network,PostgreSQL delegated subnet CIDR,,,,Network,Yes
+Network,Redis subnet CIDR,,,,Network,Yes
+Network,Hub/spoke VNet ID,,,,Network,Yes
+Network,DNS servers/forwarders,,,,Network,Yes
+Network,Firewall/NVA route requirements,,,,Network,Yes
+DNS,n8n FQDN,,,,DNS,Yes
+DNS,Internal/public DNS,,,,DNS,Yes
+Security,TLS certificate/chain,,,,Security,Yes
+Security,Terraform execution identity,,,,IAM,Yes
+Security,Azure Policy requirements,,,,Security,Yes
+Security,Outbound FQDN allow-list,,,,Security,Yes
+n8n,Enterprise license,,,,n8n,Yes
+n8n,Approved n8n image tag,,,,n8n,Yes
+n8n,Approved runner image tag,,,,n8n,Yes
+n8n,Approved Helm chart version,,,,n8n,Yes
+n8n,SSO SAML/OIDC details,,,,IAM,Yes
+n8n,SMTP details,,,,Messaging,If required
+Data,PostgreSQL HA/RPO/RTO,,,,DBA,Yes
+Data,Redis tier,,,,DBA,Yes
+Data,Storage replication,,,,Storage,Yes
+Data,Backup retention,,,,Backup,Yes
+Operations,Monitoring platform,,,,Operations,Yes
+Operations,Alert recipients,,,,Operations,Yes
+Operations,DR region,,,,DR,Recommended
